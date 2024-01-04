@@ -15,7 +15,8 @@ import torch.distributed as dist
 from torch.cuda.amp import GradScaler
 
 from evodiff.model import ByteNetLMTime
-from evodiff.utils import Tokenizer
+# from evodiff.utils import Tokenizer
+from evodiff.dna_utils import Tokenizer as DNATokenizer
 from torch.utils.data import Subset
 from sequence_models.samplers import SortishSampler, ApproxBatchSampler
 from sequence_models.datasets import UniRefDataset
@@ -23,9 +24,16 @@ from sequence_models.constants import MSA_ALPHABET
 from evodiff.collaters import OAMaskCollater, D3PMCollater
 from evodiff.losses import OAMaskedCrossEntropyLoss, D3PMCELoss, D3PMLVBLoss
 from sequence_models.metrics import MaskedAccuracy
-from sequence_models.utils import warmup 
+from sequence_models.utils import warmup
 import sys
+from evodiff.dnadiff.constant import DNA_ALPHABET, DNA_GAP
+from evodiff.dnadiff.dna_data import setup_epd_dataset
 
+# ----------------------------------------------------------
+### Debugging Flag ###
+# ----------------------------------------------------------
+import os
+os.environ['CUDA_LAUNCH_BLOCKING'] = '1'
 
 sys.setrecursionlimit(1000) # must be as large as diffusion timesteps for Q_bar calculation
 
@@ -56,7 +64,7 @@ def main():
     parser.add_argument('--final_norm', action='store_true')
     parser.add_argument('--norm_first', action='store_true') # turns norm_first on in transformer model
     parser.add_argument('--mini_run', action='store_true') # Set to True if running on subset of data
-    parser.add_argument('--mask', type=str, default='oadm')  # Set to True if running on subset of data
+    parser.add_argument('--mask', type=str, default='random')  # Set to True if running on subset of data
     parser.add_argument('--warmup', action='store_true')  # Set to True if running on subset of data
     parser.add_argument('--checkpoint_freq', type=float, default=1)  # in minutes
     parser.add_argument('--log_freq', type=float, default=10)  # in steps
@@ -75,6 +83,7 @@ def main():
     mp.spawn(train, nprocs=args.gpus, args=(args,))
 
 def train(gpu, args):
+    ptjob = True
     rs = torch.random.manual_seed(args.random_seed)
     rs = np.random.seed(int(args.random_seed))
     if args.aml:
@@ -90,7 +99,7 @@ def train(gpu, args):
     device = torch.device('cuda:' + str(gpu + args.offset))
     with open(args.config_fpath, 'r') as f:
         config = json.load(f)
-    n_tokens = len(MSA_ALPHABET)
+    n_tokens = len(DNA_ALPHABET)
     d_embed = config['d_embed']
     d_model = config['d_model']
     n_layers = config['n_layers']
@@ -123,13 +132,7 @@ def train(gpu, args):
         config['task'] = args.task
     if args.dataset is not None:
         config['dataset'] = args.dataset
-    try:
-        data_top_dir = os.getenv('PT_DATA_DIR') + '/'
-        ptjob = True
-    except:
-        data_top_dir = home + '/Desktop/DMs/data/'
-        ptjob = False
-    data_dir = data_top_dir + config['dataset'] + '/'
+    data_dir = config['dataset']
     if args.mini_run:
         mini_size = 100 # For troubleshooting
     # ----------------------------------------------------------
@@ -146,7 +149,7 @@ def train(gpu, args):
     #     diffusion_timesteps = None  # Not input to model
     elif args.mask == 'blosum' or args.mask == 'random':
         diffusion_timesteps = config['diffusion_timesteps']
-        tokenizer = Tokenizer(path_to_blosum=data_top_dir+"blosum62-special-MSA.mat", sequences=True)
+        tokenizer = DNATokenizer(sequences=True)
         if args.mask == 'random':
             Q_prod, Q_t = tokenizer.q_random_schedule(timesteps=diffusion_timesteps)
         if args.mask == 'blosum':
@@ -160,8 +163,8 @@ def train(gpu, args):
     # ----------------------------------------------------------
     ### DATALOADER ###
     # ----------------------------------------------------------
-    metadata = np.load(data_dir + 'lengths_and_offsets.npz')
-    ds_train = UniRefDataset(data_dir, 'train', structure=False)
+    ds_train, ds_valid, _ = setup_epd_dataset(data_dir, 0.8, 0.1, seed=args.random_seed)
+    # ds_train = UniRefDataset(data_dir, 'train', structure=False)
     train_idx = ds_train.indices
     if args.mini_run:
         tindices = np.arange(0,1000) # np.arange(21546293,31546293,1)#(1000000,21546293, 1)
@@ -174,15 +177,12 @@ def train(gpu, args):
                               num_workers=4,
                               collate_fn=collater)
     else:
-        len_train = metadata['ells'][train_idx]
-        train_sortish_sampler = SortishSampler(len_train, bucket_size, num_replicas=args.world_size, rank=rank)
-        train_sampler = ApproxBatchSampler(train_sortish_sampler, max_tokens, max_batch_size, len_train)
         dl_train = DataLoader(dataset=ds_train,
-                          batch_sampler=train_sampler,
-                          num_workers=16,
-                          collate_fn=collater)
+                              batch_size=max_batch_size,
+                              num_workers=16,
+                              shuffle=True,
+                              collate_fn=collater)
     if rank == 0:
-        ds_valid = UniRefDataset(data_dir, 'valid', structure=False)
         valid_idx = ds_valid.indices
         if args.mini_run:
             vindices = np.arange(1, 80000, 1)
@@ -196,12 +196,10 @@ def train(gpu, args):
                                   num_workers=4,
                                   collate_fn=collater)
         else:
-            len_valid = metadata['ells'][valid_idx]
-            valid_sortish_sampler = SortishSampler(len_valid, 1000, num_replicas=1, rank=0)
-            valid_sampler = ApproxBatchSampler(valid_sortish_sampler, max_tokens // 2, max_batch_size, len_valid)
             dl_valid = DataLoader(dataset=ds_valid,
-                              batch_sampler=valid_sampler,
-                              num_workers=8,
+                              batch_size=max_batch_size,
+                              num_workers=16,
+                              shuffle=True,
                               collate_fn=collater)
     # ----------------------------------------------------------
     # Initiate model
@@ -215,6 +213,7 @@ def train(gpu, args):
                       causal=causal, padding_idx=masking_idx, rank=weight_rank, dropout=args.dropout,
                       tie_weights=args.tie_weights, final_ln=args.final_norm, slim=slim, activation=activation,
                       timesteps=diffusion_timesteps)
+    print(model)
     optimizer = Adam(model.parameters(), lr=lr, weight_decay=args.weight_decay)
     outputs = os.listdir(args.out_fpath)
     if len(outputs) > 0:
@@ -394,6 +393,11 @@ def train(gpu, args):
 
         # Enables autocasting for the forward pass (model + loss)
         with torch.cuda.amp.autocast(dtype=torch.float32):
+            # print(f"src shape: {src.shape}")
+            # print(f"timestep shape: {timestep.shape}")
+            # print(f"input_mask shape: {input_mask.shape}")
+            # print(f"src values: {torch.unique(src[0])}")
+            # print(src[0])
             outputs = model(src, timestep, input_mask=input_mask.unsqueeze(-1))
             if args.mask == 'blosum' or args.mask == 'random':
                 lvb_loss = loss_func1(src_onehot, q, outputs, tgt, tgt_onehot, input_mask, timestep, Q, Q_bar)
@@ -441,11 +445,11 @@ def train(gpu, args):
     n_parameters = sum(p.numel() for p in model.parameters())
     if rank == 0:
         print('%d model parameters' %n_parameters)
-        print('%d training sequences' %len(len_train))
-        print('%d validation sequences' %len(len_valid))
+        print('%d training sequences' %len(train_idx))
+        print('%d validation sequences' %len(valid_idx))
+        print(f'mask type {args.mask}')
+    # ----------------------------------------------------------
     for e in range(initial_epoch, epochs):
-        if not args.mini_run:
-            train_sortish_sampler.set_epoch(e + 1)
         s, t = epoch(model, True, current_step=total_steps, current_tokens=total_tokens)
         total_steps += s
         total_tokens += t
